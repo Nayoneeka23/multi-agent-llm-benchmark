@@ -1,15 +1,18 @@
 import requests
 import time
 import sys
+
 sys.path.insert(0, '/home/jovyan/multi_agent_benchmark/core')
+
 from logger import log_message
 from llm import call_llm
+from message import NegotiationMessage
 
-# Map each agent to its own model
+
 AGENT_MODEL_MAP = {
     "agent_1": "mistral",
     "agent_2": "mistral",
-    "agent_3": "llava",
+    "agent_3": "mistral",
 }
 
 AGENT_PORTS = {
@@ -17,140 +20,335 @@ AGENT_PORTS = {
     "agent_2": 8002,
     "agent_3": 8003,
 }
+
+METRIC_KEYS = (
+    "ollama_wall_time_ms",
+    "model_compute_time_ms",
+    "prompt_eval_time_ms",
+    "generation_time_ms",
+    "load_time_ms",
+    "ollama_total_duration_ms",
+    "prompt_token_count",
+    "generated_token_count",
+)
+
+
 def get_agent_url(agent_id):
     return f"http://127.0.0.1:{AGENT_PORTS[agent_id]}"
 
-def agent_propose(agent_id, prompt, network_condition, round_number, image_path=None):
-    """An agent generates a proposal using its assigned model."""
-    model = AGENT_MODEL_MAP[agent_id]
-    # Only llava gets the image, all others just get text
-    img = image_path if model == "llava" else None
-    response, llm_time = call_llm(prompt, model=model, image_path=img)
+
+def log_llm(agent_id, prompt, condition, round_num, model, metrics):
     log_message(
         sender=agent_id,
-        receiver="broadcast",
+        receiver="llm",
         pattern="negotiation",
-        content=response,
-        network_condition=network_condition,
-        round_number=round_number,
-        llm_response_time_ms=llm_time
+        content=prompt,
+        network_condition=condition,
+        round_number=round_num,
+        ollama_wall_time_ms=metrics["ollama_wall_time_ms"],
+        model_compute_time_ms=metrics["model_compute_time_ms"],
+        prompt_eval_time_ms=metrics["prompt_eval_time_ms"],
+        generation_time_ms=metrics["generation_time_ms"],
+        load_time_ms=metrics["load_time_ms"],
+        ollama_total_duration_ms=metrics["ollama_total_duration_ms"],
+        prompt_token_count=metrics["prompt_token_count"],
+        generated_token_count=metrics["generated_token_count"],
+        model=model,
+        status="success"
     )
-    print(f"[{agent_id} | {model}] Round {round_number}: {response[:80]}...")
-    return response, llm_time
 
-def run_negotiation(topic, network_condition="baseline", max_rounds=4, image_path=None):
-    """
-    Multi-agent negotiation:
-    - agent_1 acts as the initiator/proposer
-    - agent_2 to agent_6 each respond in turn per round
-    - If any agent signals agreement, negotiation ends early
-    - image_path is optional, only used by llava (agent_6)
-    """
+
+def agent_propose(
+    agent_id,
+    prompt,
+    network_condition,
+    round_number,
+    image_path=None
+):
+    model = AGENT_MODEL_MAP[agent_id]
+
+    response, metrics = call_llm(
+        prompt,
+        model=model,
+        stream=True,
+        image_path=image_path if model == "llava" else None,
+        return_metrics=True
+    )
+
+    log_llm(
+        agent_id,
+        prompt,
+        network_condition,
+        round_number,
+        model,
+        metrics
+    )
+
+    print(
+        f"[{agent_id} | {model}] "
+        f"Round {round_number}: {response[:80]}..."
+    )
+
+    return response
+
+
+def run_negotiation(
+    topic,
+    network_condition="baseline",
+    max_rounds=4,
+    image_path=None
+):
+    agents = list(AGENT_MODEL_MAP)
+    initiator = agents[0]
+    responders = agents[1:]
+
+    all_responses = []
+    had_request_failure = False
+    failure_errors = []
+
     print(f"\n[Negotiation] Topic: {topic}")
     print(f"[Negotiation] Network condition: {network_condition}")
-    print(f"[Negotiation] Agents: {list(AGENT_MODEL_MAP.keys())}")
-    if image_path:
-        print(f"[Negotiation] Image provided (llava will use it): {image_path}\n")
+    print(f"[Negotiation] Agents: {agents}")
 
-    agents = list(AGENT_MODEL_MAP.keys())
-    initiator = agents[0]       # agent_1 starts
-    responders = agents[1:]     # agent_2 to agent_6 respond
-
-    # agent_1 makes initial proposal
     prompt = (
-        f"You are negotiation {initiator}. Make a specific initial proposal about: {topic}. "
+        f"You are negotiation agent {initiator}. "
+        f"Make a specific initial proposal about: {topic}. "
         f"Be concise (2-3 sentences)."
     )
-    current_proposal, _ = agent_propose(
-        initiator, prompt, network_condition, round_number=0, image_path=image_path
+
+    current_proposal = agent_propose(
+        initiator,
+        prompt,
+        network_condition,
+        round_number=0,
+        image_path=image_path
     )
 
     for round_num in range(1, max_rounds + 1):
         print(f"\n--- Round {round_num} ---")
+
         round_responses = []
 
         for responder in responders:
-            model = AGENT_MODEL_MAP[responder]
-            payload = {
-                "sender": initiator,
-                "receiver": responder,
-                "content": current_proposal,
-                "round_number": round_num,
-                "pattern": "negotiation",
-                "network_condition": network_condition
-            }
+            msg = NegotiationMessage(
+                sender=initiator,
+                receiver=responder,
+                content=current_proposal,
+                round_number=round_num,
+                network_condition=network_condition,
+                image_path=image_path
+            )
 
-            start = time.time()
+            # Application-level end-to-end timer:
+# includes HTTP transfer + network impairment + worker/LLM processing
+
+            start = time.perf_counter()
+
             try:
-                url = get_agent_url(responder)
-                r = requests.post(f"{url}/negotiate", json=payload, timeout=120)
-                rtt_ms = round((time.time() - start) * 1000, 2)
+                r = requests.post(
+                    f"{get_agent_url(responder)}/negotiate",
+                    json=msg.model_dump(),
+                    timeout=120
+                )
+
+                r.raise_for_status()
+
+                end_to_end_ms = round(
+                    (time.perf_counter() - start) * 1000,
+                    2
+                )
+
                 data = r.json()
 
-                counter = data.get("counter_proposal", "")
-                agreed = data.get("agreed", False)
-
                 log_message(
-                    sender=responder,
-                    receiver=initiator,
-                    pattern="negotiation",
-                    content=counter,
+                    sender=initiator,
+                    receiver=responder,
+                    pattern=msg.pattern,
+                    content=current_proposal,
                     network_condition=network_condition,
                     round_number=round_num,
-                    llm_response_time_ms=rtt_ms
+                    status="success"
                 )
-                print(f"  [{responder} | {model}] RTT {rtt_ms}ms: {counter[:80]}...")
-                round_responses.append({
-                    "agent": responder,
-                    "model": model,
-                    "counter": counter,
-                    "agreed": agreed,
-                    "rtt_ms": rtt_ms
-                })
 
-                if agreed:
-                    print(f"\n[Negotiation] AGREEMENT reached by {responder} at round {round_num}!")
-                    log_message(
-                        sender="system", receiver="system",
-                        pattern="negotiation",
-                        content=f"AGREEMENT by {responder} at round {round_num}",
-                        network_condition=network_condition,
-                        round_number=round_num
-                    )
-                    return {
-                        "rounds": round_num,
-                        "agreed": True,
-                        "agreed_by": responder,
-                        "final": counter,
-                        "responses": round_responses
-                    }
+                response_record = {
+                    "agent": responder,
+                    "model": data.get(
+                        "model",
+                        AGENT_MODEL_MAP[responder]
+                    ),
+                    "counter": data.get(
+                        "counter_proposal",
+                        ""
+                    ),
+                    "agreed": data.get(
+                        "agreed",
+                        False
+                    ),
+                    "end_to_end_ms": end_to_end_ms,
+                    **{
+                        key: data.get(key)
+                        for key in METRIC_KEYS
+                    },
+                    "status": "success",
+                    "error": None
+                }
+
+                round_responses.append(response_record)
+                all_responses.append(response_record)
+
+                print(
+                    f"  [{responder} | "
+                    f"{response_record['model']}] "
+                    f"end-to-end {end_to_end_ms}ms: "
+                    f"{response_record['counter'][:80]}..."
+                )
 
             except Exception as e:
-                print(f"  [{responder}] Round {round_num} failed: {e}")
+                had_request_failure = True
 
-        # agent_1 refines proposal based on all responses this round
-        all_counters = " | ".join([r["counter"][:60] for r in round_responses if r["counter"]])
+                failure_errors.append(
+                    f"{responder} round {round_num}: {e}"
+                )
+
+                log_message(
+                    sender=initiator,
+                    receiver=responder,
+                    pattern=msg.pattern,
+                    content=current_proposal,
+                    network_condition=network_condition,
+                    round_number=round_num,
+                    status="failed",
+                    error=str(e)
+                )
+
+                failure_record = {
+                    "agent": responder,
+                    "model": AGENT_MODEL_MAP[responder],
+                    "counter": "",
+                    "agreed": False,
+                    "end_to_end_ms": None,
+                    **{
+                        key: None
+                        for key in METRIC_KEYS
+                    },
+                    "status": "failed",
+                    "error": str(e)
+                }
+
+                round_responses.append(failure_record)
+                all_responses.append(failure_record)
+
+                print(
+                    f"  [{responder}] "
+                    f"Round {round_num} failed: {e}"
+                )
+
+        full_agreement = (
+            len(round_responses) == len(responders)
+            and all(
+                item["agreed"]
+                for item in round_responses
+            )
+        )
+
+        if full_agreement:
+            print(
+                f"\n[Negotiation] "
+                f"Full agreement reached at round {round_num}!"
+            )
+
+            return {
+                "rounds": round_num,
+                "agreed": True,
+                "agreed_by": ",".join(responders),
+                "final": current_proposal,
+                "responses": all_responses,
+                "status": (
+                    "failed"
+                    if had_request_failure
+                    else "success"
+                ),
+                "error": (
+                    "; ".join(failure_errors)
+                    if failure_errors
+                    else None
+                )
+            }
+
+        if round_num == max_rounds:
+            break
+
+        feedback = " | ".join(
+            item["counter"][:100]
+            for item in round_responses
+            if item["counter"]
+        )
+
         prompt = (
             f"You are {initiator} negotiating about {topic}. "
-            f"The other agents responded: {all_counters}. "
-            f"Refine your proposal considering their feedback (2-3 sentences)."
-        )
-        current_proposal, _ = agent_propose(
-            initiator, prompt, network_condition, round_number=round_num, image_path=image_path
+            f"The other agents responded: {feedback}. "
+            f"Refine your proposal considering their feedback "
+            f"(2-3 sentences)."
         )
 
-    print(f"\n[Negotiation] Max rounds reached. No full agreement.")
+        current_proposal = agent_propose(
+            initiator,
+            prompt,
+            network_condition,
+            round_number=round_num,
+            image_path=image_path
+        )
+
+    print(
+        "\n[Negotiation] "
+        "Max rounds reached. No full agreement."
+    )
+
     return {
         "rounds": max_rounds,
         "agreed": False,
-        "final": current_proposal
+        "agreed_by": "none",
+        "final": current_proposal,
+        "responses": all_responses,
+        "status": (
+            "failed"
+            if had_request_failure
+            else "success"
+        ),
+        "error": (
+            "; ".join(failure_errors)
+            if failure_errors
+            else None
+        )
     }
 
 
 if __name__ == "__main__":
-    topic = sys.argv[1] if len(sys.argv) > 1 else "optimal bandwidth allocation for edge nodes"
-    condition = sys.argv[2] if len(sys.argv) > 2 else "baseline"
-    image = sys.argv[3] if len(sys.argv) > 3 else None
+    topic = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "optimal bandwidth allocation for edge nodes"
+    )
 
-    result = run_negotiation(topic=topic, network_condition=condition, max_rounds=4, image_path=image)
-    print(f"\n[Negotiation] Final Result: {result}")
+    condition = (
+        sys.argv[2]
+        if len(sys.argv) > 2
+        else "baseline"
+    )
+
+    image = (
+        sys.argv[3]
+        if len(sys.argv) > 3
+        else None
+    )
+
+    result = run_negotiation(
+        topic=topic,
+        network_condition=condition,
+        max_rounds=4,
+        image_path=image
+    )
+
+    print(
+        f"\n[Negotiation] Final Result: {result}"
+    )

@@ -1,140 +1,163 @@
-import requests
-import time
-import json
-import os
 import sys
+import json
 import csv
+import os
+import time
+import subprocess
+from datetime import datetime, timezone
 
+
+sys.path.insert(0, '/home/jovyan/multi_agent_benchmark')
 sys.path.insert(0, '/home/jovyan/multi_agent_benchmark/core')
-from logger import log_message
-# 1. Imported all three prompt types
-from prompts import SIMPLE_PROMPTS, COMPLEX_PROMPTS, IMAGE_PROMPTS
 
-# ─── ISOLATED NETWORK CONDITIONS ─────────────────────────────────────────────
+from agents.coordinator import send_task
+from benchmarks.prompts import SIMPLE_PROMPTS, COMPLEX_PROMPTS
+
 NETWORK_CONDITIONS = [
-    {"name": "baseline",             "cmd": None},
-    {"name": "100ms_delay",          "cmd": "sudo tc qdisc add dev lo root netem delay 100ms"},
-    {"name": "jitter_50ms_gaussian", "cmd": "sudo tc qdisc add dev lo root netem delay 100ms 50ms distribution normal"},
-    {"name": "packet_loss_5percent", "cmd": "sudo tc qdisc add dev lo root netem loss 5%"},
-    {"name": "iot_edge_extreme",     "cmd": "sudo tc qdisc add dev lo root netem delay 500ms loss 2% rate 256kbit"}
+    {"name": "baseline", "netem": None},
+    {"name": "100ms_delay", "netem": "delay 100ms"},
+    {"name": "jitter_50ms_gaussian", "netem": "delay 100ms 50ms distribution normal"},
+    {"name": "packet_loss_5percent", "netem": "loss 5%"},
+    {"name": "iot_edge_extreme", "netem": "delay 500ms loss 2% rate 256kbit"}
 ]
-
+AGENT_PORTS = (8001, 8002, 8003)
 RESET_CMD = "sudo tc qdisc del dev lo root 2>/dev/null; true"
+EXPECTED_WORKERS = ("worker_1", "worker_2", "worker_3")
+WORKER_METRICS = ("end_to_end_ms", "ollama_wall_time_ms", "model_compute_time_ms", "prompt_eval_time_ms", "generation_time_ms", "load_time_ms", "ollama_total_duration_ms", "prompt_token_count", "generated_token_count")
 
-# ─── HETEROGENEOUS WORKERS (Mistral + Llava) ─────────────────────────────────
-WORKERS = [
-    {"id": "worker_1",  "url": "http://127.0.0.1:8001", "model": "mistral"},
-    {"id": "worker_2",  "url": "http://127.0.0.1:8002", "model": "mistral"},
-    {"id": "worker_3",  "url": "http://127.0.0.1:8003", "model": "llava"}
-]
-
-# ─── Results storage ─────────────────────────────────────────────────────────
-results = []
-os.makedirs("/home/jovyan/multi_agent_benchmark/benchmarks/results", exist_ok=True)
-
-# ─── Helper Functions ────────────────────────────────────────────────────────
-def apply_network(condition):
-    os.system(RESET_CMD)
-    if condition["cmd"]:
-        os.system(condition["cmd"])
-        time.sleep(1)
-    print(f"\n>>> Network condition: {condition['name']}")
+def run_tc(command):
+    return subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
 
 def reset_network():
-    os.system(RESET_CMD)
+    subprocess.run("sudo tc qdisc del dev lo root", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def send_to_worker(worker, prompt_text, image_path, condition_name, prompt_type, prompt_index):
-    payload = {
-        "sender": "benchmark_runner",
-        "receiver": worker["id"],
-        "content": prompt_text,
-        "round_number": 1,
-        "pattern": "coordinator_worker",
-        "network_condition": condition_name
-    }
-    
-    # If there is an image, attach it to the payload
-    if image_path:
-        payload["image_path"] = image_path
+def apply_network(condition):
+    reset_network()
 
-    start = time.time()
-    try:
-        r = requests.post(f"{worker['url']}/process", json=payload, timeout=180)
-        rtt_ms = round((time.time() - start) * 1000, 2)
-        data = r.json()
-        result = {
-            "worker_id": worker["id"],
-            "model": worker["model"],
-            "prompt_type": prompt_type,
-            "prompt_index": prompt_index,
-            "prompt_length": len(prompt_text),
-            "network_condition": condition_name,
-            "rtt_ms": rtt_ms,
-            "response_length": len(data.get("result", "")),
-            "llm_time_ms": data.get("llm_time_ms", 0),
-            "status": "success"
-        }
-        print(f"  ✓ {worker['id']} ({worker['model']}) — {rtt_ms}ms")
-    except Exception as e:
-        rtt_ms = round((time.time() - start) * 1000, 2)
-        result = {
-            "worker_id": worker["id"],
-            "model": worker["model"],
-            "prompt_type": prompt_type,
-            "prompt_index": prompt_index,
-            "prompt_length": len(prompt_text),
-            "network_condition": condition_name,
-            "rtt_ms": rtt_ms,
-            "response_length": 0,
-            "llm_time_ms": 0,
-            "status": f"error: {str(e)}"
-        }
-        print(f"  ✗ {worker['id']} failed: {e}")
-    return result
+    if condition["netem"]:
+        try:
+            run_tc("sudo tc qdisc add dev lo root handle 1: prio bands 3")
+            run_tc(f"sudo tc qdisc add dev lo parent 1:3 handle 30: netem {condition['netem']}")
 
-# ─── Main benchmark loop ─────────────────────────────────────────────────────
+            for port in AGENT_PORTS:
+                run_tc(f"sudo tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip dport {port} 0xffff flowid 1:3")
+                run_tc(f"sudo tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip protocol 6 0xff match ip sport {port} 0xffff flowid 1:3")
+
+            output = run_tc("sudo tc qdisc show dev lo").stdout
+            if "netem" not in output:
+                raise RuntimeError("tc netem was not actually activated.")
+
+        except Exception as e:
+            reset_network()
+            raise RuntimeError(f"Failed to apply {condition['name']}: {e}")
+
+        time.sleep(1)
+
+    print(f"\n>>> Network condition verified: {condition['name']}")
+
+
 def run_benchmark():
-    all_prompts = (
-        [{"type": "simple",  "index": i, "text": p,          "image_path": None} for i, p in enumerate(SIMPLE_PROMPTS)] +
-        [{"type": "complex", "index": i, "text": p,          "image_path": None} for i, p in enumerate(COMPLEX_PROMPTS)] +
-        [{"type": "image",   "index": i, "text": p["text"],  "image_path": p["image_path"]} for i, p in enumerate(IMAGE_PROMPTS)]
+    results = []
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    prompts = (
+        [{"type": "simple", "index": i, "text": p} for i, p in enumerate(SIMPLE_PROMPTS)] +
+        [{"type": "complex", "index": i, "text": p} for i, p in enumerate(COMPLEX_PROMPTS)]
     )
-
-    print(f"Starting ADVANCED ISOLATED benchmark...\n")
+    total_runs = len(NETWORK_CONDITIONS) * len(prompts)
+    count = 0
 
     for condition in NETWORK_CONDITIONS:
         apply_network(condition)
+        try:
+            for prompt in prompts:
+                count += 1
+                base_row = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_id,
+                    "prompt_run_id": f"{run_id}_{count:03d}",
+                    "pattern": "coordinator_worker",
+                    "network_condition": condition["name"],
+                    "prompt_type": prompt["type"],
+                    "prompt_index": prompt["index"],
+                    "prompt_length_chars": len(prompt["text"])
+                }
+                print(f"\n[{count}/{total_runs}] {condition['name']} | {prompt['type']} #{prompt['index']}")
 
-        for prompt in all_prompts:
-            print(f"\n  [{prompt['type'].upper()} {prompt['index']+1}] {prompt['text'][:60]}...")
-            
-            for worker in WORKERS:
-                # THE GUARD: Stop Mistral from hallucinating on images
-                if prompt["type"] == "image" and worker["model"] != "llava":
-                    print(f"  - Skipping {worker['id']} ({worker['model']}) to prevent text-model hallucination.")
-                    continue
-                
-                result = send_to_worker(worker, prompt["text"], prompt["image_path"], condition["name"], prompt["type"], prompt["index"])
-                results.append(result)
+                start = time.perf_counter()
+                try:
+                    worker_results = send_task(
+                        task=prompt["text"],
+                        network_condition=condition["name"],
+                        image_path=None
+                    )
+                    benchmark_total_time_ms = round((time.perf_counter() - start) * 1000, 2)
+                    returned = {item.get("worker"): item for item in worker_results}
 
-        reset_network()
+                    for worker_id in EXPECTED_WORKERS:
+                        item = returned.get(worker_id)
+                        if item:
+                            row = {
+                                **base_row,
+                                "worker_id": worker_id,
+                                "model": item.get("model", "mistral"),
+                                "subtask": item.get("subtask"),
+                                "response_length_chars": len(item.get("response", "")),
+                                "benchmark_total_time_ms": benchmark_total_time_ms,
+                                **{key: item.get(key) for key in WORKER_METRICS},
+                                "status": "success",
+                                "error": None
+                            }
+                        else:
+                            row = {
+                                **base_row,
+                                "worker_id": worker_id,
+                                "model": "mistral",
+                                "subtask": None,
+                                "response_length_chars": 0,
+                                "benchmark_total_time_ms": benchmark_total_time_ms,
+                                **{key: None for key in WORKER_METRICS},
+                                "status": "failed",
+                                "error": "No result returned by coordinator; see agent_messages.jsonl for the worker error."
+                            }
+                        results.append(row)
 
-    # ─── Save Results (Static Filenames) ──────────────────────────────────────
-    json_path = "/home/jovyan/multi_agent_benchmark/benchmarks/results/coordinator_benchmark.json"
+                    print(f"  -> workers={len(worker_results)}/3 | benchmark={benchmark_total_time_ms}ms")
+
+                except Exception as e:
+                    benchmark_total_time_ms = round((time.perf_counter() - start) * 1000, 2)
+                    results.append({
+                        **base_row,
+                        "worker_id": None,
+                        "model": None,
+                        "subtask": None,
+                        "response_length_chars": 0,
+                        "benchmark_total_time_ms": benchmark_total_time_ms,
+                        **{key: None for key in WORKER_METRICS},
+                        "status": "failed",
+                        "error": str(e)
+                    })
+                    print(f"  -> FAILED: {e}")
+        finally:
+            reset_network()
+
+    out_dir = "/home/jovyan/multi_agent_benchmark/benchmarks/results"
+    os.makedirs(out_dir, exist_ok=True)
+    json_path = f"{out_dir}/benchmark_coordinator_worker_results_{run_id}.json"
+    csv_path = f"{out_dir}/benchmark_coordinator_worker_results_{run_id}.csv"
+
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    csv_path = "/home/jovyan/multi_agent_benchmark/benchmarks/results/coordinator_benchmark.csv"
     if results:
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=results[0].keys())
             writer.writeheader()
             writer.writerows(results)
 
-    print(f"\n Benchmark complete!")
-    print(f"   JSON: {json_path}")
-    print(f"   CSV:  {csv_path}")
-    print(f"   Total records: {len(results)}")
+    print(f"\nBenchmark complete: {len(results)} records")
+    print(f"JSON -> {json_path}")
+    print(f"CSV  -> {csv_path}")
+
 
 if __name__ == "__main__":
     run_benchmark()
